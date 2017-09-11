@@ -72,7 +72,7 @@ As an example, this is the JSON bit which has to be added in the `target_overrid
 ```json
         "NUCLEO_F411RE": {
             "target.features_add": ["BLE"],
-            "target.extra_labels_add": ["ST_BLUENRG"]
+            "target.extra_labels_add": ["CORDIO", "CORDIO_BLUENRG"]
         },
 ```
 
