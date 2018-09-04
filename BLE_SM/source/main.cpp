@@ -19,6 +19,11 @@
 #include "ble/BLE.h"
 #include "SecurityManager.h"
 
+#if MBED_CONF_APP_FILESYSTEM_SUPPORT
+#include "LittleFileSystem.h"
+#include "HeapBlockDevice.h"
+#endif //MBED_CONF_APP_FILESYSTEM_SUPPORT
+
 /** This example demonstrates all the basic setup required
  *  for pairing and setting up link security both as a central and peripheral
  *
@@ -108,7 +113,7 @@ public:
     virtual void pairingRequest(
         ble::connection_handle_t connectionHandle
     ) {
-        printf("Pairing requested. Authorising.\r\n");
+        printf("Pairing requested - authorising\r\n");
         _ble.securityManager().acceptPairingRequest(connectionHandle);
     }
 
@@ -122,12 +127,6 @@ public:
         } else {
             printf("Pairing failed\r\n");
         }
-
-        /* disconnect in 500 ms */
-        _event_queue.call_in(
-            500, &_ble.gap(),
-            &Gap::disconnect, _handle, Gap::REMOTE_USER_TERMINATED_CONNECTION
-        );
     }
 
     /** Inform the application of change in encryption status. This will be
@@ -143,6 +142,12 @@ public:
         } else if (result == ble::link_encryption_t::NOT_ENCRYPTED) {
             printf("Link NOT_ENCRYPTED\r\n");
         }
+
+        /* disconnect in 2 s */
+        _event_queue.call_in(
+            2000, &_ble.gap(),
+            &Gap::disconnect, _handle, Gap::REMOTE_USER_TERMINATED_CONNECTION
+        );
     }
 
 private:
@@ -159,14 +164,54 @@ private:
             return;
         }
 
+        /* This path will be used to store bonding information but will fallback
+         * to storing in memory if file access fails (for example due to lack of a filesystem) */
+        const char* db_path = "/fs/bt_sec_db";
         /* If the security manager is required this needs to be called before any
          * calls to the Security manager happen. */
-        error = _ble.securityManager().init();
+        error = _ble.securityManager().init(
+            true,
+            false,
+            SecurityManager::IO_CAPS_NONE,
+            NULL,
+            false,
+            db_path
+        );
 
         if (error) {
             printf("Error during init %d\r\n", error);
             return;
         }
+
+        error = _ble.securityManager().preserveBondingStateOnReset(true);
+
+        if (error) {
+            printf("Error during preserveBondingStateOnReset %d\r\n", error);
+        }
+
+#if MBED_CONF_APP_FILESYSTEM_SUPPORT
+        /* Enable privacy so we can find the keys */
+        error = _ble.gap().enablePrivacy(true);
+
+        if (error) {
+            printf("Error enabling privacy\r\n");
+        }
+
+        Gap::PeripheralPrivacyConfiguration_t configuration_p = {
+            /* use_non_resolvable_random_address */ false,
+            Gap::PeripheralPrivacyConfiguration_t::REJECT_NON_RESOLVED_ADDRESS
+        };
+        _ble.gap().setPeripheralPrivacyConfiguration(&configuration_p);
+
+        Gap::CentralPrivacyConfiguration_t configuration_c = {
+            /* use_non_resolvable_random_address */ false,
+            Gap::CentralPrivacyConfiguration_t::RESOLVE_AND_FORWARD
+        };
+        _ble.gap().setCentralPrivacyConfiguration(&configuration_c);
+
+        /* this demo switches between being master and slave */
+        _ble.securityManager().setHintFutureRoleReversal(true);
+#endif
 
         /* Tell the security manager to use methods in this class to inform us
          * of any events. Class needs to implement SecurityManagerEventHandler. */
@@ -195,7 +240,7 @@ private:
      *  in our case it ends the demonstration. */
     void on_disconnect(const Gap::DisconnectionCallbackParams_t *event)
     {
-        printf("Disconnected - demonstration ended \r\n");
+        printf("Diconnected\r\n");
         _event_queue.break_dispatch();
     };
 
@@ -203,7 +248,7 @@ private:
      * scanning or connection initiation */
     void on_timeout(const Gap::TimeoutSource_t source)
     {
-        printf("Unexpected timeout - aborting \r\n");
+        printf("Unexpected timeout - aborting\r\n");
         _event_queue.break_dispatch();
     };
 
@@ -276,6 +321,8 @@ public:
             return;
         }
 
+        printf("Please connect to device\r\n");
+
         /** This tells the stack to generate a pairingRequest event
          * which will require this application to respond before pairing
          * can proceed. Setting it to false will automatically accept
@@ -292,6 +339,10 @@ public:
         /* remember the device that connects to us now so we can connect to it
          * during the next demonstration */
         memcpy(_peer_address, connection_event->peerAddr, sizeof(_peer_address));
+
+        printf("Connected to: %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                _peer_address[5], _peer_address[4], _peer_address[3],
+                _peer_address[2], _peer_address[1], _peer_address[0]);
 
         /* store the handle for future Security Manager requests */
         _handle = connection_event->handle;
@@ -325,6 +376,12 @@ public:
          * and scan requests responses */
         ble_error_t error = _ble.gap().startScan(this, &SMDeviceCentral::on_scan);
 
+        printf("Please advertise\r\n");
+
+        printf("Scanning for: %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+               _peer_address[5], _peer_address[4], _peer_address[3],
+               _peer_address[2], _peer_address[1], _peer_address[0]);
+
         if (error) {
             printf("Error during Gap::startScan %d\r\n", error);
             return;
@@ -339,39 +396,27 @@ public:
             return;
         }
 
-        /* parse the advertising payload, looking for a discoverable device */
-        for (uint8_t i = 0; i < params->advertisingDataLen; ++i) {
-            /* The advertising payload is a collection of key/value records where
-             * byte 0: length of the record excluding this byte
-             * byte 1: The key, it is the type of the data
-             * byte [2..N] The value. N is equal to byte0 - 1 */
-            const uint8_t record_length = params->advertisingData[i];
-            if (record_length == 0) {
-                continue;
-            }
+        /* connect to the same device that connected to us */
+        if (memcmp(params->peerAddr, _peer_address, sizeof(_peer_address)) == 0) {
 
-            /* connect to the same device that connected to us */
-            if (memcmp(params->peerAddr, _peer_address, sizeof(_peer_address)) == 0) {
+            ble_error_t error = _ble.gap().connect(
+                params->peerAddr, params->peerAddrType,
+                NULL, NULL
+            );
 
-                ble_error_t error = _ble.gap().connect(
-                    params->peerAddr, params->addressType,
-                    NULL, NULL
-                );
-
-                if (error) {
-                    printf("Error during Gap::connect %d\r\n", error);
-                    return;
-                }
-
-                /* we may have already scan events waiting
-                 * to be processed so we need to remember
-                 * that we are already connecting and ignore them */
-                _is_connecting = true;
-
+            if (error) {
+                printf("Error during Gap::connect %d\r\n", error);
                 return;
             }
 
-            i += record_length;
+            printf("Connecting... ");
+
+            /* we may have already scan events waiting
+             * to be processed so we need to remember
+             * that we are already connecting and ignore them */
+            _is_connecting = true;
+
+            return;
         }
     };
 
@@ -387,6 +432,8 @@ public:
         /* in this example the local device is the master so we request pairing */
         error = _ble.securityManager().requestPairing(_handle);
 
+        printf("Connected\r\n");
+
         if (error) {
             printf("Error during SM::requestPairing %d\r\n", error);
             return;
@@ -396,21 +443,69 @@ public:
     };
 };
 
+
+#if MBED_CONF_APP_FILESYSTEM_SUPPORT
+bool create_filesystem()
+{
+    static LittleFileSystem fs("fs");
+
+    /* replace this with any physical block device your board supports (like an SD card) */
+    static HeapBlockDevice bd(4096, 256);
+
+    int err = bd.init();
+
+    if (err) {
+        return false;
+    }
+
+    err = bd.erase(0, bd.size());
+
+    if (err) {
+        return false;
+    }
+
+    err = fs.mount(&bd);
+
+    if (err) {
+        /* Reformat if we can't mount the filesystem */
+        printf("No filesystem found, formatting...\r\n");
+
+        err = fs.reformat(&bd);
+
+        if (err) {
+            return false;
+        }
+    }
+
+    return true;
+}
+#endif //MBED_CONF_APP_FILESYSTEM_SUPPORT
+
 int main()
 {
     BLE& ble = BLE::Instance();
     events::EventQueue queue;
 
-    {
-        printf("\r\n PERIPHERAL \r\n\r\n");
-        SMDevicePeripheral peripheral(ble, queue, peer_address);
-        peripheral.run();
+#if MBED_CONF_APP_FILESYSTEM_SUPPORT
+    /* if filesystem creation fails or there is no filesystem the security manager
+     * will fallback to storing the security database in memory */
+    if (!create_filesystem()) {
+        printf("Filesystem creation failed, will use memory storage\r\n");
     }
+#endif
 
-    {
-        printf("\r\n CENTRAL \r\n\r\n");
-        SMDeviceCentral central(ble, queue, peer_address);
-        central.run();
+    while(1) {
+        {
+            printf("\r\n PERIPHERAL \r\n\r\n");
+            SMDevicePeripheral peripheral(ble, queue, peer_address);
+            peripheral.run();
+        }
+
+        {
+            printf("\r\n CENTRAL \r\n\r\n");
+            SMDeviceCentral central(ble, queue, peer_address);
+            central.run();
+        }
     }
 
     return 0;
